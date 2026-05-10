@@ -6,7 +6,7 @@ import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { QdrantVectorStore } from "@langchain/qdrant";
 import { OllamaEmbeddings } from "@langchain/ollama"
 import { OpenAIEmbeddings } from "@langchain/openai";
-
+import { useLocal } from './config/index.js'
 
 // Setup Valkey Connection
 const connection = new Redis({
