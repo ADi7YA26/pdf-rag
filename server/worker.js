@@ -1,79 +1,81 @@
-import 'dotenv/config';
-import { Worker } from 'bullmq';
-import Redis from 'ioredis';
-import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf"
+import "dotenv/config";
+import { Worker } from "bullmq";
+import Redis from "ioredis";
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { QdrantVectorStore } from "@langchain/qdrant";
-import { OllamaEmbeddings } from "@langchain/ollama"
+import { OllamaEmbeddings } from "@langchain/ollama";
 import { OpenAIEmbeddings } from "@langchain/openai";
-import { useLocal } from './config/index.js'
+import config from "./config/index.js";
 
-// Setup Valkey Connection
+// ─── Redis / Valkey Connection ────────────────────────────────────────────────
 const connection = new Redis({
-  host: process.env.VALKEY_HOST || '127.0.0.1',
-  port: process.env.VALKEY_PORT || 6379,
+  host: config.redis.host,
+  port: config.redis.port,
   maxRetriesPerRequest: null,
 });
 
-// Initialize Embeddings
-const embeddings = useLocal
+// ─── Embeddings ───────────────────────────────────────────────────────────────
+const embeddings = config.useLocal
   ? new OllamaEmbeddings({
-    model: "nomic-embed-text", 
-    baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+    model: config.ollama.embeddingModel,
+    baseUrl: config.ollama.baseUrl,
   })
   : new OpenAIEmbeddings({
-    openAIApiKey: process.env.OPENAI_API_KEY,
-  })
+    openAIApiKey: config.openai.apiKey,
+  });
 
-// Define the processing logic
+// ─── Job Processor ────────────────────────────────────────────────────────────
+/**
+ * Process a single PDF job:
+ *  1. Load the PDF from disk
+ *  2. Split into overlapping chunks
+ *  3. Attach metadata (fileId, userId) for per-document filtering
+ *  4. Upsert into Qdrant
+ */
 const processPdfJob = async (job) => {
   const { filePath, fileId, userId } = job.data;
 
-  try {
-    console.log(`Processing PDF for file: ${fileId}`);
+  console.log(`[worker] Processing job ${job.id} — file: ${fileId}`);
 
-    // Load PDF
-    const loader = new PDFLoader(filePath);
-    const rawDocs = await loader.load();
+  // Load PDF
+  const loader = new PDFLoader(filePath);
+  const rawDocs = await loader.load();
 
-    // Split into chunks
-    const splitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 1000,
-      chunkOverlap: 200,
-    });
-    const docs = await splitter.splitDocuments(rawDocs);
+  // Split into chunks
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 200,
+  });
+  const docs = await splitter.splitDocuments(rawDocs);
 
-    // Add metadata for Qdrant filtering
-    const docsWithMetadata = docs.map(doc => ({
-      ...doc,
-      metadata: { ...doc.metadata, fileId, userId },
-    }));
+  // Attach metadata for Qdrant filtering
+  const docsWithMetadata = docs.map((doc) => ({
+    ...doc,
+    metadata: { ...doc.metadata, fileId, userId },
+  }));
 
-    await QdrantVectorStore.fromDocuments(docsWithMetadata, embeddings, {
-      url: process.env.QDRANT_URL || 'http://localhost:6333',
-      collectionName: "pdf_documents",
-    });
+  await QdrantVectorStore.fromDocuments(docsWithMetadata, embeddings, {
+    url: config.qdrant.url,
+    collectionName: config.qdrant.collectionName,
+  });
 
-    console.log(`Successfully indexed file: ${fileId}`);
-    return { status: 'completed', fileId };
-  } catch (error) {
-    console.error(`Error processing job ${job.id}:`, error);
-    throw error; // Let BullMQ handle the retry
-  }
+  console.log(`[worker] Successfully indexed file: ${fileId}`);
+  return { status: "completed", fileId };
 };
 
-// Initialize the Worker
-const worker = new Worker('pdf-queue', processPdfJob, { 
+// ─── Worker ───────────────────────────────────────────────────────────────────
+const worker = new Worker("pdf-queue", processPdfJob, {
   connection,
-  concurrency: 1, // Process 1 PDFs at a time to manage CPU/Rate limits
+  concurrency: 1, // Process one PDF at a time to manage CPU / rate limits
 });
 
-worker.on('completed', (job) => {
-  console.log(`Job ${job.id} has completed!`);
+worker.on("completed", (job) => {
+  console.log(`[worker] Job ${job.id} completed`);
 });
 
-worker.on('failed', (job, err) => {
-  console.log(`Job ${job.id} has failed with ${err.message}`);
+worker.on("failed", (job, err) => {
+  console.error(`[worker] Job ${job?.id} failed: ${err.message}`);
 });
 
-console.log('Worker is running and waiting for jobs...');
+console.log("[worker] Running and waiting for jobs...");
